@@ -7,7 +7,7 @@ export default defineConfig({
       fileName: "index",
       formats: ["es"]
     },
-    sourcemap: true,
+    sourcemap: false,
     target: "esnext",
     minify: false,
     rollupOptions: {
