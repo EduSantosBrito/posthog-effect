@@ -1,14 +1,9 @@
 import * as Context from "effect/Context"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Layer, Redacted } from "effect"
 import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 
 import { PostHogTransportError } from "./PostHogError"
-import type { BatchRequest, FeatureFlagsRequest, FeatureFlagsSnapshot } from "./PostHogModel"
-
-const FeatureFlagsResponseSchema = Schema.Struct({
-  featureFlags: Schema.Record(Schema.String, Schema.Union([Schema.Boolean, Schema.String])),
-  featureFlagPayloads: Schema.Record(Schema.String, Schema.Unknown)
-})
+import { FeatureFlagsSnapshotSchema, type BatchRequest, type FeatureFlagsRequest, type FeatureFlagsSnapshot } from "./PostHogModel"
 
 const makeTransportError = (message: string, cause: unknown) =>
   new PostHogTransportError({
@@ -37,7 +32,7 @@ export class PostHogTransport extends Context.Service<PostHogTransport, PostHogT
               HttpClientRequest.acceptJson,
               HttpClientRequest.bodyJson({
                 anonymous_distinct_id: request.anonymousId,
-                api_key: request.apiKey,
+                api_key: Redacted.value(request.apiKey),
                 distinct_id: request.distinctId
               }),
               Effect.mapError((cause) => makeTransportError("Failed to encode feature flags request", cause))
@@ -48,7 +43,7 @@ export class PostHogTransport extends Context.Service<PostHogTransport, PostHogT
               Effect.mapError((cause) => makeTransportError("Feature flags request failed", cause))
             )
 
-            return yield* HttpClientResponse.schemaBodyJson(FeatureFlagsResponseSchema)(response).pipe(
+            return yield* HttpClientResponse.schemaBodyJson(FeatureFlagsSnapshotSchema)(response).pipe(
               Effect.mapError((cause) => makeTransportError("Failed to decode feature flags response", cause))
             )
           }),
@@ -57,7 +52,7 @@ export class PostHogTransport extends Context.Service<PostHogTransport, PostHogT
             const encodedRequest = yield* HttpClientRequest.post(batchUrl(request.apiHost)).pipe(
               HttpClientRequest.acceptJson,
               HttpClientRequest.bodyJson({
-                api_key: request.apiKey,
+                api_key: Redacted.value(request.apiKey),
                 batch: request.batch,
                 sent_at: request.sentAt
               }),

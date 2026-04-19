@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest"
-import { Effect, Fiber, Layer, Ref } from "effect"
+import { Effect, Fiber, Layer, Redacted, Ref } from "effect"
 import { TestClock } from "effect/testing"
 
 import {
@@ -7,6 +7,7 @@ import {
   PostHog,
   PostHogConfig,
   PostHogPersistence,
+  PostHogRetry,
   PostHogTransport,
   PostHogTransportError,
   type BatchRequest,
@@ -49,6 +50,7 @@ const makeTestLayer = (
   attempts: Ref.Ref<number>,
   snapshot: FeatureFlagsSnapshot,
   options: {
+    readonly disableRetries?: boolean
     readonly failUntilAttempt?: number
     readonly flushAt?: number
     readonly maxBatchSize?: number
@@ -56,6 +58,7 @@ const makeTestLayer = (
   } = {}
 ) =>
   PostHog.Live.pipe(
+    Layer.provide(options.disableRetries === true ? PostHogRetry.none : PostHogRetry.layer),
     Layer.provide(PostHogConfig.layer({
       apiKey: "test_api_key",
       fetchRetryBaseDelayMs: 100,
@@ -116,6 +119,22 @@ const waitForBatchCount = (batches: Ref.Ref<ReadonlyArray<BatchRequest>>, expect
   })
 
 describe("PostHog Core", () => {
+  describe("config", () => {
+    it.effect("redacts api keys in parsed settings", () =>
+      Effect.gen(function*() {
+        const settings = yield* Effect.gen(function*() {
+          return yield* PostHogConfig
+        }).pipe(
+          Effect.provide(PostHogConfig.layer({
+            apiKey: "test_api_key"
+          }))
+        )
+
+        expect(Redacted.value(settings.apiKey)).toBe("test_api_key")
+        expect(String(settings.apiKey)).not.toContain("test_api_key")
+      }))
+  })
+
   describe("capture", () => {
     it.effect("should capture an event", () =>
       Effect.gen(function*() {
@@ -427,6 +446,68 @@ describe("PostHog Core", () => {
 
         expect(yield* Ref.get(attempts)).toBe(3)
         expect(yield* Ref.get(batches)).toHaveLength(1)
+      }))
+
+    it.effect("respects injected retry policy", () =>
+      Effect.gen(function*() {
+        const batches = yield* Ref.make<ReadonlyArray<BatchRequest>>([])
+        const flagsRequests = yield* Ref.make(0)
+        const attempts = yield* Ref.make(0)
+        const layer = makeTestLayer(batches, flagsRequests, attempts, emptySnapshot(), {
+          disableRetries: true,
+          failUntilAttempt: 1,
+          flushAt: 10
+        })
+
+        const error = yield* withPostHog(
+          layer,
+          Effect.gen(function*() {
+            yield* PostHog.capture("retry-event")
+            const failure = yield* PostHog.flush().pipe(Effect.flip)
+            yield* PostHog.optOut()
+            return failure
+          })
+        )
+
+        expect(error).toBeInstanceOf(PostHogTransportError)
+        expect(yield* Ref.get(attempts)).toBe(1)
+        expect(yield* Ref.get(batches)).toHaveLength(0)
+      }))
+
+    it.effect("surfaces background flush failures on the next operation", () =>
+      Effect.gen(function*() {
+        const batches = yield* Ref.make<ReadonlyArray<BatchRequest>>([])
+        const flagsRequests = yield* Ref.make(0)
+        const attempts = yield* Ref.make(0)
+        const layer = makeTestLayer(batches, flagsRequests, attempts, emptySnapshot(), {
+          failUntilAttempt: 3,
+          flushAt: 1
+        })
+
+        const error = yield* withPostHog(
+          layer,
+          Effect.gen(function*() {
+            yield* PostHog.capture("background-failure")
+            yield* TestClock.adjust("5 seconds")
+
+            const failure = yield* PostHog.capture("after-background-failure").pipe(Effect.flip)
+
+            yield* PostHog.capture("recovered")
+            yield* PostHog.flush()
+
+            return failure
+          })
+        )
+
+        expect(error).toBeInstanceOf(PostHogTransportError)
+        expect(yield* Ref.get(attempts)).toBe(4)
+
+        const sentBatches = yield* Ref.get(batches)
+        expect(sentBatches).toHaveLength(1)
+        expect(sentBatches[0]?.batch.map((message) => message.event)).toEqual([
+          "background-failure",
+          "recovered"
+        ])
       }))
   })
 

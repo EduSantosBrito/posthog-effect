@@ -1,5 +1,5 @@
 import * as Context from "effect/Context"
-import { Config, ConfigProvider, Effect, Layer, Schema } from "effect"
+import { Config, ConfigProvider, Effect, Layer, Redacted, Schema } from "effect"
 
 import { PostHogConfigError } from "./PostHogError"
 
@@ -19,7 +19,7 @@ export interface PostHogConfigInput {
 
 export interface PostHogSettings {
   readonly apiHost: string
-  readonly apiKey: string
+  readonly apiKey: Redacted.Redacted<string>
   readonly disabled: boolean
   readonly fetchRetryBaseDelayMs: number
   readonly fetchRetryCount: number
@@ -46,7 +46,7 @@ const DEFAULT_SETTINGS = {
 
 const PostHogSettingsSchema = Schema.Struct({
   apiHost: Schema.String,
-  apiKey: Schema.String,
+  apiKey: Schema.RedactedFromValue(Schema.String),
   disabled: Schema.Boolean,
   fetchRetryBaseDelayMs: Schema.Int,
   fetchRetryCount: Schema.Int,
@@ -60,7 +60,7 @@ const PostHogSettingsSchema = Schema.Struct({
 
 const PostHogEnvConfig = Config.all({
   apiHost: Config.string("apiHost").pipe(Config.withDefault(DEFAULT_SETTINGS.apiHost)),
-  apiKey: Config.string("apiKey"),
+  apiKey: Config.redacted("apiKey"),
   disabled: Config.boolean("disabled").pipe(Config.withDefault(DEFAULT_SETTINGS.disabled)),
   fetchRetryBaseDelayMs: Config.int("fetchRetryBaseDelayMs").pipe(
     Config.withDefault(DEFAULT_SETTINGS.fetchRetryBaseDelayMs)
@@ -80,7 +80,9 @@ const PostHogEnvProvider = ConfigProvider.fromEnv().pipe(ConfigProvider.constant
 
 const validateSettings = (settings: PostHogSettings) =>
   Effect.gen(function*() {
-    if (settings.apiKey.trim().length === 0) {
+    const apiKey = Redacted.value(settings.apiKey)
+
+    if (apiKey.trim().length === 0) {
       return yield* new PostHogConfigError({
         message: "PostHog apiKey must be non-empty",
         cause: settings.apiKey

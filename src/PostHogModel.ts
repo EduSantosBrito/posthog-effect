@@ -1,3 +1,5 @@
+import { Redacted, Schema } from "effect"
+
 export type JsonPrimitive = boolean | null | number | string
 
 export type JsonValue = JsonPrimitive | JsonObject | JsonArray
@@ -7,6 +9,10 @@ export interface JsonArray extends ReadonlyArray<JsonValue> {}
 export interface JsonObject {
   readonly [key: string]: JsonValue
 }
+
+export const JsonValueSchema = Schema.Json
+
+export const JsonObjectSchema = Schema.Record(Schema.String, Schema.Json)
 
 export interface CaptureOptions {
   readonly timestamp?: Date
@@ -26,19 +32,31 @@ export interface PostHogMessage {
 
 export type FeatureFlagValue = boolean | string
 
+export const FeatureFlagValueSchema = Schema.Union([Schema.Boolean, Schema.String])
+
 export interface FeatureFlagsSnapshot {
   readonly featureFlags: Readonly<Record<string, FeatureFlagValue>>
   readonly featureFlagPayloads: Readonly<Record<string, unknown>>
 }
+
+export const FeatureFlagsSnapshotSchema = Schema.Struct({
+  featureFlags: Schema.Record(Schema.String, FeatureFlagValueSchema),
+  featureFlagPayloads: Schema.Record(Schema.String, Schema.Unknown)
+})
 
 export interface PersonPropertiesSnapshot {
   readonly set: Readonly<Record<string, JsonValue>>
   readonly setOnce: Readonly<Record<string, JsonValue>>
 }
 
+export const PersonPropertiesSnapshotSchema = Schema.Struct({
+  set: JsonObjectSchema,
+  setOnce: JsonObjectSchema
+})
+
 export interface BatchRequest {
   readonly apiHost: string
-  readonly apiKey: string
+  readonly apiKey: Redacted.Redacted<string>
   readonly batch: ReadonlyArray<PostHogMessage>
   readonly sentAt: string
 }
@@ -46,7 +64,7 @@ export interface BatchRequest {
 export interface FeatureFlagsRequest {
   readonly anonymousId: string
   readonly apiHost: string
-  readonly apiKey: string
+  readonly apiKey: Redacted.Redacted<string>
   readonly distinctId: string
 }
 

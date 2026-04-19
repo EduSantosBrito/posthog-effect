@@ -1,4 +1,4 @@
-import { Clock, Effect, Layer, Option, Queue, Ref, Schedule } from "effect"
+import { Clock, Effect, Layer, Option, Queue, Ref, Schema } from "effect"
 import * as Context from "effect/Context"
 
 import { PostHogConfig, type PostHogConfigInput, type PostHogSettings } from "./PostHogConfig"
@@ -9,13 +9,16 @@ import {
   type CaptureOptions,
   type FeatureFlagValue,
   type FeatureFlagsRequest,
+  FeatureFlagsSnapshotSchema,
   type FeatureFlagsSnapshot,
+  JsonObjectSchema,
   type JsonObject,
   type JsonValue,
   type PersonPropertiesSnapshot,
   type PostHogMessage
 } from "./PostHogModel"
 import { PostHogPersistence } from "./PostHogPersistence"
+import { PostHogRetry } from "./PostHogRetry"
 import { PostHogTransport } from "./PostHogTransport"
 
 interface RuntimeState {
@@ -24,7 +27,6 @@ interface RuntimeState {
   readonly distinctId: string
   readonly featureFlagPayloads: Readonly<Record<string, unknown>>
   readonly featureFlags: Readonly<Record<string, FeatureFlagValue>>
-  readonly identified: boolean
   readonly optedOut: boolean
   readonly personProperties: Readonly<Record<string, JsonValue>>
   readonly personPropertiesOnce: Readonly<Record<string, JsonValue>>
@@ -64,53 +66,23 @@ const emptyPersonProperties = (): PersonPropertiesSnapshot => ({
   setOnce: {}
 })
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === "object" && value !== null && !Array.isArray(value)
+const decodePersistedString = Schema.decodeUnknownOption(Schema.String)
 
-const isJsonValue = (value: unknown): value is JsonValue => {
-  if (value === null) {
-    return true
-  }
+const decodePersistedBoolean = Schema.decodeUnknownOption(Schema.Boolean)
 
-  if (typeof value === "boolean" || typeof value === "number" || typeof value === "string") {
-    return true
-  }
+const decodePersistedFeatureFlagsSnapshot = Schema.decodeUnknownOption(FeatureFlagsSnapshotSchema)
 
-  if (Array.isArray(value)) {
-    return value.every(isJsonValue)
-  }
+const decodePersistedJsonObject = Schema.decodeUnknownOption(JsonObjectSchema)
 
-  if (isRecord(value)) {
-    return Object.values(value).every(isJsonValue)
-  }
+const decodeWithFallback = <A>(decoder: (value: unknown) => Option.Option<A>, value: unknown, orElse: () => A): A =>
+  Option.match(decoder(value), {
+    onNone: orElse,
+    onSome: (decoded) => decoded
+  })
 
-  return false
-}
+const isJsonObject = (value: unknown): value is JsonObject => Option.isSome(decodePersistedJsonObject(value))
 
-const isJsonObject = (value: unknown): value is JsonObject => isRecord(value) && Object.values(value).every(isJsonValue)
-
-const isJsonRecord = (value: unknown): value is Readonly<Record<string, JsonValue>> => isJsonObject(value)
-
-const isFeatureFlagsSnapshot = (value: unknown): value is FeatureFlagsSnapshot => {
-  if (!isRecord(value)) {
-    return false
-  }
-
-  const featureFlags = value.featureFlags
-  const featureFlagPayloads = value.featureFlagPayloads
-
-  if (!isRecord(featureFlags) || !isRecord(featureFlagPayloads)) {
-    return false
-  }
-
-  for (const flagValue of Object.values(featureFlags)) {
-    if (typeof flagValue !== "boolean" && typeof flagValue !== "string") {
-      return false
-    }
-  }
-
-  return true
-}
+const isIdentified = (state: Pick<RuntimeState, "anonymousId" | "distinctId">) => state.anonymousId !== state.distinctId
 
 const jsonValuesEqual = (left: JsonValue | undefined, right: JsonValue): boolean => {
   if (left === right) {
@@ -175,16 +147,13 @@ const currentTimestamp = (provided?: Date) =>
 
 const currentUuid = (provided?: string) => Effect.sync(() => provided ?? globalThis.crypto.randomUUID())
 
-const makeRetrySchedule = (config: PostHogSettings) =>
-  Schedule.exponential(config.fetchRetryBaseDelayMs).pipe(Schedule.both(Schedule.recurs(config.fetchRetryCount)))
-
 const hasProperties = (properties: Readonly<Record<string, unknown>>) => Object.keys(properties).length > 0
 
 const makeBaseProperties = (config: PostHogSettings, state: RuntimeState): JsonObject => ({
-  $is_identified: state.identified,
+  $is_identified: isIdentified(state),
   $lib: config.library,
   $lib_version: config.libraryVersion,
-  $process_person_profile: state.identified,
+  $process_person_profile: isIdentified(state),
   $session_id: state.anonymousId
 })
 
@@ -350,10 +319,11 @@ export class PostHog extends Context.Service<PostHog, PostHogService>()("PostHog
     Effect.gen(function*() {
       const config = yield* PostHogConfig
       const persistence = yield* PostHogPersistence
+      const retryPolicy = yield* PostHogRetry
       const transport = yield* PostHogTransport
       const queue = yield* Queue.bounded<PostHogMessage>(config.queueCapacity)
       const flushRequests = yield* Queue.unbounded<void>()
-      const retrySchedule = makeRetrySchedule(config)
+      const backgroundFlushErrorRef = yield* Ref.make<Option.Option<PostHogRuntimeError>>(Option.none())
       const persistedAnonymousId = yield* persistence.get(PersistedProperty.AnonymousId)
       const persistedDistinctId = yield* persistence.get(PersistedProperty.DistinctId)
       const persistedFeatureFlags = yield* persistence.get(PersistedProperty.FeatureFlags)
@@ -361,20 +331,22 @@ export class PostHog extends Context.Service<PostHog, PostHogService>()("PostHog
       const persistedOptedOut = yield* persistence.get(PersistedProperty.OptedOut)
       const persistedPersonProperties = yield* persistence.get(PersistedProperty.PersonProperties)
       const persistedPersonPropertiesOnce = yield* persistence.get(PersistedProperty.PersonPropertiesOnce)
-      const anonymousId = typeof persistedAnonymousId === "string" ? persistedAnonymousId : yield* createId()
-      const distinctId = typeof persistedDistinctId === "string" ? persistedDistinctId : anonymousId
+      const emptyPersonSnapshot = emptyPersonProperties()
+      const anonymousIdOption = decodePersistedString(persistedAnonymousId)
+      const anonymousId = Option.isSome(anonymousIdOption) ? anonymousIdOption.value : yield* createId()
+      const distinctId = decodeWithFallback(decodePersistedString, persistedDistinctId, () => anonymousId)
       const initialSnapshotCandidate: unknown = {
         featureFlagPayloads: persistedFeatureFlagPayloads,
         featureFlags: persistedFeatureFlags
       }
-      const initialSnapshot = isFeatureFlagsSnapshot(initialSnapshotCandidate)
-        ? initialSnapshotCandidate
-        : emptyFeatureFlags()
+      const initialSnapshot = decodeWithFallback(
+        decodePersistedFeatureFlagsSnapshot,
+        initialSnapshotCandidate,
+        emptyFeatureFlags
+      )
       const initialPersonProperties: PersonPropertiesSnapshot = {
-        set: isJsonRecord(persistedPersonProperties) ? persistedPersonProperties : emptyPersonProperties().set,
-        setOnce: isJsonRecord(persistedPersonPropertiesOnce)
-          ? persistedPersonPropertiesOnce
-          : emptyPersonProperties().setOnce
+        set: decodeWithFallback(decodePersistedJsonObject, persistedPersonProperties, () => emptyPersonSnapshot.set),
+        setOnce: decodeWithFallback(decodePersistedJsonObject, persistedPersonPropertiesOnce, () => emptyPersonSnapshot.setOnce)
       }
 
       yield* persistence.set(PersistedProperty.AnonymousId, anonymousId)
@@ -386,13 +358,27 @@ export class PostHog extends Context.Service<PostHog, PostHogService>()("PostHog
         distinctId,
         featureFlagPayloads: initialSnapshot.featureFlagPayloads,
         featureFlags: initialSnapshot.featureFlags,
-        identified: anonymousId !== distinctId,
-        optedOut: persistedOptedOut === true,
+        optedOut: decodeWithFallback(decodePersistedBoolean, persistedOptedOut, () => false),
         personProperties: initialPersonProperties.set,
         personPropertiesOnce: initialPersonProperties.setOnce
       })
 
       const requestBackgroundFlush = Queue.offer(flushRequests, undefined).pipe(Effect.asVoid)
+
+      const storeBackgroundFlushError = (error: PostHogRuntimeError) =>
+        Ref.set(backgroundFlushErrorRef, Option.some(error))
+
+      const failOnBackgroundFlushError: Effect.Effect<void, PostHogRuntimeError> = Ref.getAndSet(
+        backgroundFlushErrorRef,
+        Option.none()
+      ).pipe(
+        Effect.flatMap((failure) =>
+          Option.match(failure, {
+            onNone: () => Effect.void,
+            onSome: (error) => Effect.fail(error)
+          })
+        )
+      )
 
       const flushImpl: Effect.Effect<void, PostHogRuntimeError> = Effect.gen(function*() {
         const state = yield* Ref.get(stateRef)
@@ -419,7 +405,7 @@ export class PostHog extends Context.Service<PostHog, PostHogService>()("PostHog
           }
 
           yield* transport.sendBatch(request).pipe(
-            Effect.retry(retrySchedule),
+            Effect.retry(retryPolicy),
             Effect.catch((error: PostHogTransportError) => enqueueAll(queue, pending).pipe(Effect.andThen(Effect.fail(error))))
           )
 
@@ -428,8 +414,10 @@ export class PostHog extends Context.Service<PostHog, PostHogService>()("PostHog
       })
 
       yield* Effect.forever(
-        Queue.take(flushRequests).pipe(Effect.andThen(flushImpl), Effect.catch(() => Effect.void))
-      ).pipe(Effect.forkScoped)
+        Queue.take(flushRequests).pipe(
+          Effect.andThen(flushImpl.pipe(Effect.catch((error: PostHogRuntimeError) => storeBackgroundFlushError(error))))
+        )
+      ).pipe(Effect.catch(() => Effect.void), Effect.forkScoped)
 
       const ensureOpen: Effect.Effect<RuntimeState, PostHogStateError> = Effect.gen(function*() {
         const state = yield* Ref.get(stateRef)
@@ -449,6 +437,7 @@ export class PostHog extends Context.Service<PostHog, PostHogService>()("PostHog
         options: CaptureOptions = {}
       ) =>
         Effect.gen(function*() {
+          yield* failOnBackgroundFlushError
           const state = yield* ensureOpen
 
           if (config.disabled || state.optedOut) {
@@ -489,6 +478,7 @@ export class PostHog extends Context.Service<PostHog, PostHogService>()("PostHog
 
       const reloadFeatureFlagsImpl: PostHogService["reloadFeatureFlags"] = () =>
         Effect.gen(function*() {
+          yield* failOnBackgroundFlushError
           const state = yield* ensureOpen
 
           if (config.disabled || state.optedOut) {
@@ -502,7 +492,7 @@ export class PostHog extends Context.Service<PostHog, PostHogService>()("PostHog
             distinctId: state.distinctId
           }
 
-          const snapshot = yield* transport.loadFeatureFlags(request).pipe(Effect.retry(retrySchedule))
+          const snapshot = yield* transport.loadFeatureFlags(request).pipe(Effect.retry(retryPolicy))
 
           yield* Ref.update(stateRef, (current) => ({
             ...current,
@@ -516,9 +506,10 @@ export class PostHog extends Context.Service<PostHog, PostHogService>()("PostHog
 
       const identifyImpl: PostHogService["identify"] = (nextDistinctId: string, properties: JsonObject = {}) =>
         Effect.gen(function*() {
+          yield* failOnBackgroundFlushError
           const state = yield* ensureOpen
           const split = splitIdentifyProperties(properties)
-          const isNewIdentity = state.distinctId !== nextDistinctId || state.identified === false
+          const isNewIdentity = state.distinctId !== nextDistinctId || !isIdentified(state)
           const nextPersonProperties = isNewIdentity
             ? {
                 set: split.setProperties,
@@ -535,7 +526,6 @@ export class PostHog extends Context.Service<PostHog, PostHogService>()("PostHog
           yield* Ref.update(stateRef, (current) => ({
             ...current,
             distinctId: nextDistinctId,
-            identified: true,
             personProperties: nextPersonProperties.set,
             personPropertiesOnce: nextPersonProperties.setOnce
           }))
@@ -554,7 +544,7 @@ export class PostHog extends Context.Service<PostHog, PostHogService>()("PostHog
             const timestamp = yield* currentTimestamp()
             const uuid = yield* currentUuid()
             const identifyProperties: Record<string, JsonValue> = {
-              ...makeBaseProperties(config, { ...state, distinctId: nextDistinctId, identified: true }),
+              ...makeBaseProperties(config, { ...state, distinctId: nextDistinctId }),
               $anon_distinct_id: state.anonymousId,
               $set: split.setProperties
             }
@@ -583,6 +573,7 @@ export class PostHog extends Context.Service<PostHog, PostHogService>()("PostHog
 
       const resetImpl: PostHogService["reset"] = (preserve: ReadonlyArray<PersistedProperty> = []) =>
         Effect.gen(function*() {
+          yield* failOnBackgroundFlushError
           yield* ensureOpen
 
           const nextAnonymousId = yield* createId()
@@ -595,7 +586,6 @@ export class PostHog extends Context.Service<PostHog, PostHogService>()("PostHog
             distinctId: nextAnonymousId,
             featureFlagPayloads: keepFlagPayloads ? state.featureFlagPayloads : {},
             featureFlags: keepFlags ? state.featureFlags : {},
-            identified: false,
             optedOut: state.optedOut,
             personProperties: {},
             personPropertiesOnce: {}
@@ -619,6 +609,7 @@ export class PostHog extends Context.Service<PostHog, PostHogService>()("PostHog
 
       const shutdownImpl: PostHogService["shutdown"] = () =>
         Effect.gen(function*() {
+          yield* failOnBackgroundFlushError
           const state = yield* Ref.get(stateRef)
 
           if (state.closed) {
@@ -636,7 +627,7 @@ export class PostHog extends Context.Service<PostHog, PostHogService>()("PostHog
 
       const service: PostHogService = {
         capture: captureImpl,
-        flush: () => flushImpl,
+        flush: () => failOnBackgroundFlushError.pipe(Effect.andThen(flushImpl)),
         getDistinctId: () => Ref.get(stateRef).pipe(Effect.map((state) => state.distinctId)),
         getFeatureFlag: (key: string) => Ref.get(stateRef).pipe(Effect.map((state) => state.featureFlags[key])),
         getFeatureFlagPayload: (key: string) => Ref.get(stateRef).pipe(Effect.map((state) => state.featureFlagPayloads[key])),
@@ -668,6 +659,7 @@ export class PostHog extends Context.Service<PostHog, PostHogService>()("PostHog
 
   static readonly layer = (input: PostHogConfigInput) =>
     PostHog.Live.pipe(
+      Layer.provide(PostHogRetry.layer),
       Layer.provide(PostHogConfig.layer(input)),
       Layer.provide(PostHogPersistence.Memory),
       Layer.provide(PostHogTransport.Fetch)
@@ -675,6 +667,7 @@ export class PostHog extends Context.Service<PostHog, PostHogService>()("PostHog
 
   static readonly browserLayer = (input: PostHogConfigInput) =>
     PostHog.Live.pipe(
+      Layer.provide(PostHogRetry.layer),
       Layer.provide(PostHogConfig.layer(input)),
       Layer.provide(PostHogPersistence.Browser),
       Layer.provide(PostHogTransport.Fetch)
@@ -682,6 +675,7 @@ export class PostHog extends Context.Service<PostHog, PostHogService>()("PostHog
 
   static readonly layerFromEnv = () =>
     PostHog.Live.pipe(
+      Layer.provide(PostHogRetry.layer),
       Layer.provide(PostHogConfig.fromEnv),
       Layer.provide(PostHogPersistence.Memory),
       Layer.provide(PostHogTransport.Fetch)

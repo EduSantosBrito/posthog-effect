@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest"
-import { Effect, Layer, Ref } from "effect"
+import { Effect, Layer, Redacted, Ref } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 
 import { PostHogTransport, PostHogTransportError, type BatchRequest } from "../src"
@@ -42,7 +42,7 @@ describe("PostHog Transport", () => {
       )
       const request: BatchRequest = {
         apiHost: "https://us.i.posthog.com",
-        apiKey: "test_api_key",
+        apiKey: Redacted.make("test_api_key"),
         batch: [
           {
             distinct_id: "user-123",
@@ -99,7 +99,7 @@ describe("PostHog Transport", () => {
         service.loadFeatureFlags({
           anonymousId: "anon-123",
           apiHost: "https://us.i.posthog.com",
-          apiKey: "test_api_key",
+          apiKey: Redacted.make("test_api_key"),
           distinctId: "user-123"
         })
       ).pipe(Effect.provide(layer))
@@ -138,7 +138,7 @@ describe("PostHog Transport", () => {
       const exit = yield* PostHogTransport.use((service) =>
         service.sendBatch({
           apiHost: "https://us.i.posthog.com",
-          apiKey: "test_api_key",
+          apiKey: Redacted.make("test_api_key"),
           batch: [],
           sentAt: "2022-01-01T00:00:00.000Z"
         })
