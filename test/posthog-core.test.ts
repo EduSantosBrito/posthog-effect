@@ -51,6 +51,7 @@ const makeTestLayer = (
   options: {
     readonly failUntilAttempt?: number
     readonly flushAt?: number
+    readonly maxBatchSize?: number
     readonly persistenceLayer?: Layer.Layer<PostHogPersistence>
   } = {}
 ) =>
@@ -60,7 +61,7 @@ const makeTestLayer = (
       fetchRetryBaseDelayMs: 100,
       fetchRetryCount: 2,
       flushAt: options.flushAt ?? 1,
-      maxBatchSize: 20,
+      maxBatchSize: options.maxBatchSize ?? 20,
       queueCapacity: 100
     })),
     Layer.provide(options.persistenceLayer ?? PostHogPersistence.Memory),
@@ -97,6 +98,22 @@ const firstMessage = (batches: ReadonlyArray<BatchRequest>) => {
 }
 
 const resetBatches = (batches: Ref.Ref<ReadonlyArray<BatchRequest>>) => Ref.set(batches, [])
+
+const waitForBatchCount = (batches: Ref.Ref<ReadonlyArray<BatchRequest>>, expected: number, remaining = 50): Effect.Effect<void> =>
+  Effect.gen(function*() {
+    const current = yield* Ref.get(batches)
+
+    if (current.length >= expected) {
+      return
+    }
+
+    if (remaining <= 0) {
+      return yield* Effect.die(`expected ${expected} batches, got ${current.length}`)
+    }
+
+    yield* Effect.yieldNow
+    yield* waitForBatchCount(batches, expected, remaining - 1)
+  })
 
 describe("PostHog Core", () => {
   describe("capture", () => {
@@ -305,6 +322,36 @@ describe("PostHog Core", () => {
   })
 
   describe("flush", () => {
+    it.effect("auto flushes once the queue reaches flushAt", () =>
+      Effect.gen(function*() {
+        const batches = yield* Ref.make<ReadonlyArray<BatchRequest>>([])
+        const flagsRequests = yield* Ref.make(0)
+        const attempts = yield* Ref.make(0)
+        const layer = makeTestLayer(batches, flagsRequests, attempts, emptySnapshot(), { flushAt: 3 })
+
+        yield* withPostHog(
+          layer,
+          Effect.gen(function*() {
+            yield* PostHog.capture("test-event-1")
+            yield* PostHog.capture("test-event-2")
+            yield* Effect.yieldNow
+
+            expect(yield* Ref.get(batches)).toHaveLength(0)
+
+            yield* PostHog.capture("test-event-3")
+            yield* waitForBatchCount(batches, 1)
+          })
+        )
+
+        const sentBatches = yield* Ref.get(batches)
+        expect(sentBatches).toHaveLength(1)
+        expect(sentBatches[0]?.batch.map((message) => message.event)).toEqual([
+          "test-event-1",
+          "test-event-2",
+          "test-event-3"
+        ])
+      }))
+
     it.effect("flush messages once called", () =>
       Effect.gen(function*() {
         const batches = yield* Ref.make<ReadonlyArray<BatchRequest>>([])
@@ -330,6 +377,37 @@ describe("PostHog Core", () => {
           "test-event-1",
           "test-event-2",
           "test-event-3"
+        ])
+      }))
+
+    it.effect("splits flushed messages by maxBatchSize", () =>
+      Effect.gen(function*() {
+        const batches = yield* Ref.make<ReadonlyArray<BatchRequest>>([])
+        const flagsRequests = yield* Ref.make(0)
+        const attempts = yield* Ref.make(0)
+        const layer = makeTestLayer(batches, flagsRequests, attempts, emptySnapshot(), {
+          flushAt: 10,
+          maxBatchSize: 2
+        })
+
+        yield* withPostHog(
+          layer,
+          Effect.gen(function*() {
+            yield* PostHog.capture("test-event-1")
+            yield* PostHog.capture("test-event-2")
+            yield* PostHog.capture("test-event-3")
+            yield* PostHog.capture("test-event-4")
+            yield* PostHog.capture("test-event-5")
+            yield* PostHog.flush()
+          })
+        )
+
+        const sentBatches = yield* Ref.get(batches)
+        expect(sentBatches).toHaveLength(3)
+        expect(sentBatches.map((batch) => batch.batch.map((message) => message.event))).toEqual([
+          ["test-event-1", "test-event-2"],
+          ["test-event-3", "test-event-4"],
+          ["test-event-5"]
         ])
       }))
 
